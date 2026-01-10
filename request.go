@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -422,12 +423,83 @@ type closeWriter interface {
 	CloseWrite() error
 }
 
-// proxy is used to shuffle data from src to destination, and sends errors
-// down a dedicated channel
+type closeReader interface {
+	CloseRead() error
+}
+
 func proxy(dst io.Writer, src io.Reader, errCh chan error) {
-	_, err := io.Copy(dst, src)
-	if tcpConn, ok := dst.(closeWriter); ok {
-		tcpConn.CloseWrite()
-	}
+	err := ProxyStream(src, dst)
 	errCh <- err
+}
+
+// ProxyStream forwards data from src to dst, similar to io.Copy, but with improved performance.
+// Unlike io.Copy’s sequential read/write model, it allows reads to continue while writes are in progress,
+// avoiding read-side underutilization when writes are slow.
+// ProxyStream closes both the read and write sides when the transfer completes.
+func ProxyStream(src io.Reader, dst io.Writer) error {
+	const (
+		bufSize    = 64 << 10 // 64 KiB
+		numBuffers = 8
+	)
+
+	type bufSlot struct {
+		buf []byte
+		n   int
+	}
+
+	bufPool := make(chan *bufSlot, numBuffers)
+	for i := 0; i < numBuffers; i++ {
+		bufPool <- &bufSlot{buf: make([]byte, bufSize)}
+	}
+
+	writeDataCh := make(chan *bufSlot, numBuffers)
+
+	// Writer goroutine
+	writeErrCh := make(chan error, 1)
+	go func() {
+		var writeErr error
+		for buf := range writeDataCh {
+			if writeErr == nil {
+				_, writeErr = dst.Write(buf.buf[:buf.n])
+			}
+			bufPool <- buf
+		}
+		if writeErr != nil {
+			writeErr = fmt.Errorf("write error: %v", writeErr)
+		}
+		writeErrCh <- writeErr
+
+		// Close read side to unblock reader loop
+		if conn, ok := src.(closeReader); ok {
+			_ = conn.CloseRead()
+		}
+	}()
+
+	// Reader loop
+	var readErr error
+	for readErr == nil {
+		buf := <-bufPool
+		buf.n, readErr = src.Read(buf.buf)
+		if buf.n > 0 {
+			writeDataCh <- buf
+		} else {
+			bufPool <- buf
+		}
+	}
+
+	if errors.Is(readErr, io.EOF) {
+		readErr = nil
+	} else {
+		readErr = fmt.Errorf("read error: %v", readErr)
+	}
+
+	close(writeDataCh)
+	writeErr := <-writeErrCh
+
+	// Close write side
+	if conn, ok := dst.(closeWriter); ok {
+		_ = conn.CloseWrite()
+	}
+
+	return errors.Join(writeErr, readErr)
 }
