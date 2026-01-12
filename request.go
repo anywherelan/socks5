@@ -439,7 +439,7 @@ func proxy(dst io.Writer, src io.Reader, errCh chan error) {
 func ProxyStream(src io.Reader, dst io.Writer) error {
 	const (
 		bufSize    = 64 << 10 // 64 KiB
-		numBuffers = 8
+		numBuffers = 16
 	)
 
 	type bufSlot struct {
@@ -453,16 +453,36 @@ func ProxyStream(src io.Reader, dst io.Writer) error {
 	}
 
 	writeDataCh := make(chan *bufSlot, numBuffers)
+	// Start small, it will grow if necessary to a maximum of bufSize * bufSize
+	writeBuf := make([]byte, 0, bufSize)
 
 	// Writer goroutine
 	writeErrCh := make(chan error, 1)
 	go func() {
 		var writeErr error
 		for buf := range writeDataCh {
-			if writeErr == nil {
-				_, writeErr = dst.Write(buf.buf[:buf.n])
-			}
+			writeBuf = append(writeBuf, buf.buf[:buf.n]...)
 			bufPool <- buf
+
+		batchLoop:
+			for i := 0; i < numBuffers; i++ {
+				select {
+				case buf2, ok := <-writeDataCh:
+					if !ok {
+						break batchLoop
+					}
+					writeBuf = append(writeBuf, buf2.buf[:buf2.n]...)
+					bufPool <- buf2
+				default:
+					break batchLoop
+				}
+			}
+			_, writeErr = dst.Write(writeBuf)
+			writeBuf = writeBuf[:0]
+
+			if writeErr != nil {
+				break
+			}
 		}
 		if writeErr != nil {
 			writeErr = fmt.Errorf("write error: %v", writeErr)
