@@ -188,3 +188,32 @@ func (s *Server) ServeConn(conn net.Conn) error {
 
 	return nil
 }
+
+// ServeConnNoAuth is used to serve a single connection where the auth
+// negotiation has already been handled by the caller (e.g. locally on the client side).
+// It skips the version byte read and authentication, going directly to request handling.
+func (s *Server) ServeConnNoAuth(conn net.Conn) error {
+	defer conn.Close()
+
+	request, err := NewRequest(conn)
+	if err != nil {
+		if err == errUnrecognizedAddrType {
+			if err := sendReply(conn, ReplyAddrTypeNotSupported, nil); err != nil {
+				return fmt.Errorf("failed to send reply: %v", err)
+			}
+		}
+		return fmt.Errorf("failed to read destination address: %v", err)
+	}
+	request.AuthContext = &AuthContext{Method: AuthMethodNoAuth}
+	if client, ok := conn.RemoteAddr().(*net.TCPAddr); ok {
+		request.RemoteAddr = &AddrSpec{IP: client.IP, Port: client.Port}
+	}
+
+	if err := s.handleRequest(request, conn); err != nil {
+		err = fmt.Errorf("failed to handle request: %v", err)
+		s.config.Logger.Printf("socks: %v", err)
+		return err
+	}
+
+	return nil
+}
