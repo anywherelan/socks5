@@ -2,6 +2,7 @@ package socks5
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"net"
@@ -236,19 +237,14 @@ func (s *Server) handleConnect(ctx context.Context, conn net.Conn, req *Request)
 	}
 
 	// Start proxying
-	errCh := make(chan error, 2)
-	go proxy(target, req.bufConn, errCh)
-	go proxy(conn, target, errCh)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- ProxyStream(req.bufConn, target)
+	}()
+	err1 := ProxyStream(target, conn)
+	err2 := <-errCh
 
-	// Wait
-	for i := 0; i < 2; i++ {
-		e := <-errCh
-		if e != nil {
-			// return from this function closes target (and conn).
-			return e
-		}
-	}
-	return nil
+	return errors.Join(err1, err2)
 }
 
 // handleBind is used to handle a connect command
@@ -416,18 +412,4 @@ func sendReply(w io.Writer, resp uint8, addr *AddrSpec) error {
 	// Send the message
 	_, err := w.Write(msg)
 	return err
-}
-
-type closeWriter interface {
-	CloseWrite() error
-}
-
-// proxy is used to shuffle data from src to destination, and sends errors
-// down a dedicated channel
-func proxy(dst io.Writer, src io.Reader, errCh chan error) {
-	_, err := io.Copy(dst, src)
-	if tcpConn, ok := dst.(closeWriter); ok {
-		tcpConn.CloseWrite()
-	}
-	errCh <- err
 }
